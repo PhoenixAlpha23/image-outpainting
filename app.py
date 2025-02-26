@@ -2,15 +2,19 @@ import gradio as gr
 import spaces
 import torch
 from diffusers import AutoencoderKL, TCDScheduler
-from diffusers.models.model_loading_utils import load_state_dict
+from diffusers.models.modeling_utils import load_state_dict
 from gradio_imageslider import ImageSlider
 from huggingface_hub import hf_hub_download
-
 from controlnet_union import ControlNetModel_Union
 from pipeline_fill_sd_xl import StableDiffusionXLFillPipeline
-
 from PIL import Image, ImageDraw
 import numpy as np
+
+# Check if CUDA is available
+device = "cuda" if torch.cuda.is_available() else "cpu"
+dtype = torch.float16 if device == "cuda" else torch.float32
+
+print(f"Using device: {device}")
 
 config_file = hf_hub_download(
     "xinsir/controlnet-union-sdxl-1.0",
@@ -27,19 +31,20 @@ state_dict = load_state_dict(model_file)
 model, _, _, _, _ = ControlNetModel_Union._load_pretrained_model(
     controlnet_model, state_dict, model_file, "xinsir/controlnet-union-sdxl-1.0"
 )
-model.to(device="cuda", dtype=torch.float16)
+model.to(device=device, dtype=dtype)
 
 vae = AutoencoderKL.from_pretrained(
-    "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16
-).to("cuda")
+    "madebyollin/sdxl-vae-fp16-fix", 
+    torch_dtype=dtype
+).to(device)
 
 pipe = StableDiffusionXLFillPipeline.from_pretrained(
     "SG161222/RealVisXL_V5.0_Lightning",
-    torch_dtype=torch.float16,
+    torch_dtype=dtype,
     vae=vae,
     controlnet=model,
-    variant="fp16",
-).to("cuda")
+    variant="fp16" if device == "cuda" else None,
+).to(device)
 
 pipe.scheduler = TCDScheduler.from_config(pipe.scheduler.config)
 
@@ -169,7 +174,7 @@ def preview_image_and_mask(image, width, height, overlap_percentage, resize_opti
     return preview
 
 @spaces.GPU(duration=24)
-def infer(image, width, height, overlap_percentage, num_inference_steps, resize_option, custom_resize_percentage, prompt_input, alignment, overlap_left, overlap_right, overlap_top, overlap_bottom):
+def infer(image, width, height, overlap_percentage, num_inference_steps, resize_option, custom_resize_percentage, alignment, overlap_left, overlap_right, overlap_top, overlap_bottom):
     background, mask = prepare_image_and_mask(image, width, height, overlap_percentage, resize_option, custom_resize_percentage, alignment, overlap_left, overlap_right, overlap_top, overlap_bottom)
     
     if not can_expand(background.width, background.height, width, height, alignment):
@@ -178,7 +183,7 @@ def infer(image, width, height, overlap_percentage, num_inference_steps, resize_
     cnet_image = background.copy()
     cnet_image.paste(0, (0, 0), mask)
 
-    final_prompt = f"{prompt_input} , high quality, 4k"
+    final_prompt = "high quality, 4k"
 
     (
         prompt_embeds,
@@ -211,17 +216,17 @@ def preload_presets(target_ratio, ui_width, ui_height):
     if target_ratio == "9:16":
         changed_width = 720
         changed_height = 1280
-        return changed_width, changed_height, gr.update()
+        return changed_width, changed_height
     elif target_ratio == "16:9":
         changed_width = 1280
         changed_height = 720
-        return changed_width, changed_height, gr.update()
+        return changed_width, changed_height
     elif target_ratio == "1:1":
         changed_width = 1024
         changed_height = 1024
-        return changed_width, changed_height, gr.update()
+        return changed_width, changed_height
     elif target_ratio == "Custom":
-        return ui_width, ui_height, gr.update(open=True)
+        return ui_width, ui_height
 
 def select_the_right_preset(user_width, user_height):
     if user_width == 720 and user_height == 1280:
@@ -236,28 +241,14 @@ def select_the_right_preset(user_width, user_height):
 def toggle_custom_resize_slider(resize_option):
     return gr.update(visible=(resize_option == "Custom"))
 
-def update_history(new_image, history):
-    """Updates the history gallery with the new image."""
-    if history is None:
-        history = []
-    history.insert(0, new_image)
-    return history
-
 css = """
 .gradio-container {
     width: 1200px !important;
 }
 """
 
-title = """<h1 align="center">Diffusers Image Outpaint</h1>
+title = """<h1 align="center">Diffusers Image Outpainting</h1>
 <div align="center">Drop an image you would like to extend, pick your expected ratio and hit Generate.</div>
-<div style="display: flex; justify-content: center; align-items: center; text-align: center;">
-    <p style="display: flex;gap: 6px;">
-         <a href="https://huggingface.co/spaces/fffiloni/diffusers-image-outpout?duplicate=true">
-            <img src="https://huggingface.co/datasets/huggingface/badges/resolve/main/duplicate-this-space-md.svg" alt="Duplicate this Space">
-        </a> to skip the queue and enjoy faster inference on the GPU of your choice 
-    </p>
-</div>
 """
 
 with gr.Blocks(css=css) as demo:
@@ -272,12 +263,6 @@ with gr.Blocks(css=css) as demo:
                 )
 
                 with gr.Row():
-                    with gr.Column(scale=2):
-                        prompt_input = gr.Textbox(label="Prompt (Optional)")
-                    with gr.Column(scale=1):
-                        run_button = gr.Button("Generate")
-
-                with gr.Row():
                     target_ratio = gr.Radio(
                         label="Expected Ratio",
                         choices=["9:16", "16:9", "1:1", "Custom"],
@@ -285,102 +270,34 @@ with gr.Blocks(css=css) as demo:
                         scale=2
                     )
                     
-                    alignment_dropdown = gr.Dropdown(
-                        choices=["Middle", "Left", "Right", "Top", "Bottom"],
-                        value="Middle",
-                        label="Alignment"
+                    run_button = gr.Button("Generate")
+
+                with gr.Row():
+                    width_slider = gr.Slider(
+                        label="Target Width",
+                        minimum=720,
+                        maximum=1536,
+                        step=8,
+                        value=720,
                     )
-
-                with gr.Accordion(label="Advanced settings", open=False) as settings_panel:
-                    with gr.Column():
-                        with gr.Row():
-                            width_slider = gr.Slider(
-                                label="Target Width",
-                                minimum=720,
-                                maximum=1536,
-                                step=8,
-                                value=720,  # Set a default value
-                            )
-                            height_slider = gr.Slider(
-                                label="Target Height",
-                                minimum=720,
-                                maximum=1536,
-                                step=8,
-                                value=1280,  # Set a default value
-                            )
-                        
-                        num_inference_steps = gr.Slider(label="Steps", minimum=4, maximum=12, step=1, value=8)
-                        with gr.Group():
-                            overlap_percentage = gr.Slider(
-                                label="Mask overlap (%)",
-                                minimum=1,
-                                maximum=50,
-                                value=10,
-                                step=1
-                            )
-                            with gr.Row():
-                                overlap_top = gr.Checkbox(label="Overlap Top", value=True)
-                                overlap_right = gr.Checkbox(label="Overlap Right", value=True)
-                            with gr.Row():
-                                overlap_left = gr.Checkbox(label="Overlap Left", value=True)
-                                overlap_bottom = gr.Checkbox(label="Overlap Bottom", value=True)
-                        with gr.Row():
-                            resize_option = gr.Radio(
-                                label="Resize input image",
-                                choices=["Full", "50%", "33%", "25%", "Custom"],
-                                value="Full"
-                            )
-                            custom_resize_percentage = gr.Slider(
-                                label="Custom resize (%)",
-                                minimum=1,
-                                maximum=100,
-                                step=1,
-                                value=50,
-                                visible=False
-                            )
-                        
-                        with gr.Column():
-                            preview_button = gr.Button("Preview alignment and mask")
-                            
-                            
-                gr.Examples(
-                    examples=[
-                        ["./examples/example_1.webp", 1280, 720, "Middle"],
-                        ["./examples/example_2.jpg", 1440, 810, "Left"],
-                        ["./examples/example_3.jpg", 1024, 1024, "Top"],
-                        ["./examples/example_3.jpg", 1024, 1024, "Bottom"],
-                    ],
-                    inputs=[input_image, width_slider, height_slider, alignment_dropdown],
-                )
-
-                
+                    height_slider = gr.Slider(
+                        label="Target Height",
+                        minimum=720,
+                        maximum=1536,
+                        step=8,
+                        value=1280,
+                    )
 
             with gr.Column():
                 result = ImageSlider(
                     interactive=False,
                     label="Generated Image",
                 )
-                use_as_input_button = gr.Button("Use as Input Image", visible=False)
 
-                history_gallery = gr.Gallery(label="History", columns=6, object_fit="contain", interactive=False)
-                preview_image = gr.Image(label="Preview")
-
-        
-
-    def use_output_as_input(output_image):
-        """Sets the generated output as the new input image."""
-        return gr.update(value=output_image[1])
-
-    use_as_input_button.click(
-        fn=use_output_as_input,
-        inputs=[result],
-        outputs=[input_image]
-    )
-    
     target_ratio.change(
         fn=preload_presets,
         inputs=[target_ratio, width_slider, height_slider],
-        outputs=[width_slider, height_slider, settings_panel],
+        outputs=[width_slider, height_slider],
         queue=False
     )
 
@@ -398,59 +315,25 @@ with gr.Blocks(css=css) as demo:
         queue=False
     )
 
-    resize_option.change(
-        fn=toggle_custom_resize_slider,
-        inputs=[resize_option],
-        outputs=[custom_resize_percentage],
-        queue=False
-    )
-    
-    run_button.click(  # Clear the result
+    # Default values for the inference function
+    overlap_percentage = gr.State(value=10)
+    num_inference_steps = gr.State(value=8)
+    resize_option = gr.State(value="Full")
+    custom_resize_percentage = gr.State(value=50)
+    alignment = gr.State(value="Middle")
+    overlap_left = gr.State(value=True)
+    overlap_right = gr.State(value=True)
+    overlap_top = gr.State(value=True)
+    overlap_bottom = gr.State(value=True)
+
+    run_button.click(
         fn=clear_result,
         inputs=None,
         outputs=result,
-    ).then(  # Generate the new image
+    ).then(
         fn=infer,
-        inputs=[input_image, width_slider, height_slider, overlap_percentage, num_inference_steps,
-                resize_option, custom_resize_percentage, prompt_input, alignment_dropdown,
-                overlap_left, overlap_right, overlap_top, overlap_bottom],
+        inputs=[input_image, width_slider, height_slider, overlap_percentage, num_inference_steps, resize_option, custom_resize_percentage, alignment, overlap_left, overlap_right, overlap_top, overlap_bottom],
         outputs=result,
-    ).then(  # Update the history gallery
-        fn=lambda x, history: update_history(x[1], history),
-        inputs=[result, history_gallery],
-        outputs=history_gallery,
-    ).then(  # Show the "Use as Input Image" button
-        fn=lambda: gr.update(visible=True),
-        inputs=None,
-        outputs=use_as_input_button,
-    )
-
-    prompt_input.submit(  # Clear the result
-        fn=clear_result,
-        inputs=None,
-        outputs=result,
-    ).then(  # Generate the new image
-        fn=infer,
-        inputs=[input_image, width_slider, height_slider, overlap_percentage, num_inference_steps,
-                resize_option, custom_resize_percentage, prompt_input, alignment_dropdown,
-                overlap_left, overlap_right, overlap_top, overlap_bottom],
-        outputs=result,
-    ).then(  # Update the history gallery
-        fn=lambda x, history: update_history(x[1], history),
-        inputs=[result, history_gallery],
-        outputs=history_gallery,
-    ).then(  # Show the "Use as Input Image" button
-        fn=lambda: gr.update(visible=True),
-        inputs=None,
-        outputs=use_as_input_button,
-    )
-
-    preview_button.click(
-        fn=preview_image_and_mask,
-        inputs=[input_image, width_slider, height_slider, overlap_percentage, resize_option, custom_resize_percentage, alignment_dropdown,
-                overlap_left, overlap_right, overlap_top, overlap_bottom],
-        outputs=preview_image,
-        queue=False
     )
 
 demo.queue(max_size=12).launch(share=False)
